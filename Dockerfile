@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Build the application from source
-FROM --platform=$BUILDPLATFORM golang:1.22 AS build-stage
+FROM --platform=$BUILDPLATFORM golang:1.24 AS build-stage
 ARG  TARGETOS
 ARG  TARGETARCH
 
@@ -13,7 +13,7 @@ RUN go mod download
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags "-s -w" -o /acexy
 
 # Create a minimal image
-FROM alpine:3.18 AS final-stage
+FROM alpine:latest AS final-stage
 
 COPY --from=build-stage /acexy         /acexy
 EXPOSE 8080
