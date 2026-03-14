@@ -267,8 +267,13 @@ func (o *Orchestrator) waitForHealthy(instance *AceStreamInstance) error {
 }
 
 // removeContainer removes a container (used for cleanup after an error).
+// Returns nil if the container is already gone (AutoRemove may have cleaned it up).
 func (o *Orchestrator) removeContainer(ctx context.Context, containerID string) error {
-	return o.dockerClient.ContainerRemove(ctx, containerID, containerRemoveOptions())
+	err := o.dockerClient.ContainerRemove(ctx, containerID, containerRemoveOptions())
+	if err != nil && isNotFound(err) {
+		return nil
+	}
+	return err
 }
 
 // TouchPoolActivity updates the last activity timestamp of the pool and resets the recycled flag.
@@ -331,7 +336,7 @@ func (o *Orchestrator) scaleDownIdle() {
 		slog.Info("Scaling down idle instance", "name", instance.Name,
 			"idleSince", instance.LastActivity)
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil {
+		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil && !isNotFound(err) {
 			slog.Warn("Failed to remove idle instance", "containerID", id[:12], "error", err)
 		} else {
 			delete(o.instances, id)
@@ -376,7 +381,7 @@ func (o *Orchestrator) recycleIfIdle() {
 	defer cancel()
 	for id, inst := range o.instances {
 		slog.Info("Recycling instance", "name", inst.Name)
-		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil {
+		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil && !isNotFound(err) {
 			slog.Warn("Failed to remove instance during recycle", "name", inst.Name, "error", err)
 		}
 		delete(o.instances, id)
@@ -411,7 +416,7 @@ func (o *Orchestrator) Shutdown() {
 	slog.Info("Shutting down orchestrator, removing all instances", "count", len(o.instances))
 	for id, instance := range o.instances {
 		slog.Info("Removing instance", "name", instance.Name, "host", instance.Host)
-		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil {
+		if err := o.dockerClient.ContainerRemove(ctx, id, containerRemoveOptions()); err != nil && !isNotFound(err) {
 			slog.Warn("Failed to remove instance", "containerID", id[:12], "error", err)
 		}
 		delete(o.instances, id)

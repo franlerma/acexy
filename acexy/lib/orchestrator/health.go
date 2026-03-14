@@ -157,7 +157,7 @@ func (o *Orchestrator) killAndReplace(inst *AceStreamInstance) {
 	slog.Info("Killing unhealthy instance", "name", inst.Name, "remaining", remaining)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := o.dockerClient.ContainerRemove(ctx, inst.ContainerID, containerRemoveOptions()); err != nil {
+	if err := o.dockerClient.ContainerRemove(ctx, inst.ContainerID, containerRemoveOptions()); err != nil && !isNotFound(err) {
 		slog.Warn("Failed to remove unhealthy instance", "name", inst.Name, "error", err)
 	}
 

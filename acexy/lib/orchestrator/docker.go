@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/errdefs"
 )
 
 // randomHex generates a random hexadecimal string of n bytes.
@@ -23,17 +24,23 @@ func randomHex(n int) string {
 }
 
 const (
-	aceStreamVolumeBind   = "/opt/docker/volumes/localstreams/acestream:/home/localstreams/.ACEStream"
 	defaultRegularNetwork = "bridge"
 	vpnContainer          = "gluetun"
 )
 
 // containerRemoveOptions returns the standard options for removing containers.
+// containerRemoveOptions returns the standard options for removing containers.
 func containerRemoveOptions() container.RemoveOptions {
 	return container.RemoveOptions{
 		Force:         true,
-		RemoveVolumes: false, // keep the AceStream cache volume
+		RemoveVolumes: false,
 	}
+}
+
+// isNotFound returns true if the error is a Docker "not found" error,
+// which happens when a container has already been removed (e.g. via AutoRemove).
+func isNotFound(err error) bool {
+	return errdefs.IsNotFound(err)
 }
 
 // createContainer creates and starts an AceStream container according to the configured profile.
@@ -57,8 +64,8 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 	}
 
 	hostCfg := &container.HostConfig{
-		Binds:         []string{aceStreamVolumeBind},
 		RestartPolicy: container.RestartPolicy{Name: "no"},
+		AutoRemove:    true, // remove container and its anonymous volumes automatically when it stops
 	}
 
 	netCfg := &network.NetworkingConfig{}

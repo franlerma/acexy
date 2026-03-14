@@ -46,6 +46,7 @@ services:
       POST: 1
       DELETE: 1
       NETWORKS: 1
+      VOLUMES: 1
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
