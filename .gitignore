@@ -27,6 +27,9 @@ go.work.sum
 # The binary file for the application
 acexy/acexy
 
+#opencode
+token-optimizer
+
 # VSCode files - we don't want those to get pushed to the repo
 .vscode/
 .claude/

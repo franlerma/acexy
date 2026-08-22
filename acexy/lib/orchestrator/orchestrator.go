@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,6 +47,7 @@ type Orchestrator struct {
 	idleTimeout        time.Duration
 	profile              string    // "regular" or "vpn"
 	image                string    // Docker image to use
+	dnsServers           []string  // DNS servers to apply to created containers (empty = Docker default)
 	lastPoolActivity     time.Time // last time any stream was active across the whole pool
 	recycled             bool      // true after a recycle, reset only when a new stream arrives
 	recycleCheckInterval time.Duration // how often recycleIfIdle is checked
@@ -62,6 +64,7 @@ type Orchestrator struct {
 	Profile                   string
 	Image                     string
 	DockerHost                string
+	DNSServers                string // comma-separated DNS servers for AceStream containers
 	ComposeProject            string // value of com.docker.compose.project
 	ComposeWorkingDir         string // value of com.docker.compose.project.working_dir
 	ContainerNetwork          string // Docker network acexy is connected to; used to attach AceStream instances
@@ -78,6 +81,7 @@ func (o *Orchestrator) Init() error {
 	o.idleTimeout = o.IdleTimeout
 	o.profile = o.Profile
 	o.image = o.Image
+	o.dnsServers = parseDNSServers(o.DNSServers)
 
 	o.lastPoolActivity = time.Now()
 
@@ -422,4 +426,16 @@ func (o *Orchestrator) Shutdown() {
 		delete(o.instances, id)
 	}
 	slog.Info("Orchestrator shutdown complete")
+}
+
+// parseDNSServers parses a comma-separated DNS server list into a slice,
+// trimming whitespace and skipping empty entries. Returns nil if empty.
+func parseDNSServers(csv string) []string {
+	var servers []string
+	for _, part := range strings.Split(csv, ",") {
+		if s := strings.TrimSpace(part); s != "" {
+			servers = append(servers, s)
+		}
+	}
+	return servers
 }

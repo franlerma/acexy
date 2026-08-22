@@ -47,6 +47,7 @@ var (
 	scaleDownInterval         time.Duration
 	composeProfile            string
 	acestreamImage            string
+	acestreamDNSServers       string
 	dockerHost                string
 	containerFailureThreshold int
 	streamFailureThreshold    int
@@ -463,6 +464,12 @@ func parseArgs() {
 		"Docker image to use for AceStream instances. Can be set with ACESTREAM_IMAGE environment variable",
 	)
 	flag.StringVar(
+		&acestreamDNSServers,
+		"acestream-dns-servers",
+		LookupEnvOrString("ACEXY_ACESTREAM_DNS_SERVERS", ""),
+		"comma-separated DNS servers applied to AceStream containers. Can be set with ACEXY_ACESTREAM_DNS_SERVERS environment variable",
+	)
+	flag.StringVar(
 		&dockerHost,
 		"docker-host",
 		LookupEnvOrString("DOCKER_HOST", "tcp://docker-proxy:2375"),
@@ -513,6 +520,7 @@ func main() {
 		Profile:                   composeProfile,
 		Image:                     acestreamImage,
 		DockerHost:                dockerHost,
+		DNSServers:                acestreamDNSServers,
 		ComposeProject:            composeProject,
 		ComposeWorkingDir:         composeWorkingDir,
 		ContainerNetwork:          containerNetwork,

@@ -68,6 +68,10 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		AutoRemove:    true, // remove container and its anonymous volumes automatically when it stops
 	}
 
+	if len(o.dnsServers) > 0 {
+		hostCfg.DNS = o.dnsServers
+	}
+
 	netCfg := &network.NetworkingConfig{}
 
 	if o.profile == "vpn" {
