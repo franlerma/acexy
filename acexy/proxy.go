@@ -45,7 +45,7 @@ var (
 	recycleTimeout            time.Duration
 	recycleCheckInterval      time.Duration
 	scaleDownInterval         time.Duration
-	composeProfile            string
+	vpnContainer              string
 	acestreamImage            string
 	acestreamDNSServers       string
 	dockerHost                string
@@ -452,10 +452,11 @@ func parseArgs() {
 		"how often the scale down check runs. Can be set with ACESTREAM_SCALE_DOWN_INTERVAL environment variable",
 	)
 	flag.StringVar(
-		&composeProfile,
-		"compose-profile",
-		LookupEnvOrString("COMPOSE_PROFILE", "regular"),
-		"Docker Compose profile to use (regular or vpn). Can be set with COMPOSE_PROFILE environment variable",
+		&vpnContainer,
+		"vpn-container",
+		LookupEnvOrString("ACESTREAM_VPN_CONTAINER", ""),
+		"name of the VPN container whose network namespace all AceStream instances will share. "+
+			"Empty = regular bridge networking. Can be set with ACESTREAM_VPN_CONTAINER environment variable",
 	)
 	flag.StringVar(
 		&acestreamImage,
@@ -517,7 +518,7 @@ func main() {
 		RecycleTimeout:            recycleTimeout,
 		RecycleCheckInterval:      recycleCheckInterval,
 		ScaleDownInterval:         scaleDownInterval,
-		Profile:                   composeProfile,
+		VPNContainer:              vpnContainer,
 		Image:                     acestreamImage,
 		DockerHost:                dockerHost,
 		DNSServers:                acestreamDNSServers,

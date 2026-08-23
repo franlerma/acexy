@@ -15,7 +15,7 @@ import (
 type HealthStatus int
 
 const (
-	Healthy   HealthStatus = iota
+	Healthy HealthStatus = iota
 	Degraded
 	Unhealthy
 	Dead
@@ -29,27 +29,28 @@ type AceStreamInstance struct {
 	Port               int
 	Health             HealthStatus
 	LastCheck          time.Time
-	FailureCount       int  // consecutive container health check failures
-	StreamFailureCount int  // consecutive times all active streams were stalled simultaneously
-	ActiveStreams       int
+	FailureCount       int // consecutive container health check failures
+	StreamFailureCount int // consecutive times all active streams were stalled simultaneously
+	ActiveStreams      int
 	CreatedAt          time.Time
 	LastActivity       time.Time
 }
 
 // Orchestrator manages the pool of AceStream instances.
 type Orchestrator struct {
-	instances          map[string]*AceStreamInstance
-	mutex              *sync.RWMutex
-	dockerClient       *client.Client
-	minReplicas        int
-	maxReplicas        int
-	streamsPerInstance int
-	idleTimeout        time.Duration
-	profile              string    // "regular" or "vpn"
-	image                string    // Docker image to use
-	dnsServers           []string  // DNS servers to apply to created containers (empty = Docker default)
-	lastPoolActivity     time.Time // last time any stream was active across the whole pool
-	recycled             bool      // true after a recycle, reset only when a new stream arrives
+	instances            map[string]*AceStreamInstance
+	mutex                *sync.RWMutex
+	dockerClient         *client.Client
+	minReplicas          int
+	maxReplicas          int
+	streamsPerInstance   int
+	idleTimeout          time.Duration
+	vpnContainer         string        // name of VPN container to share network namespace with (empty = disabled)
+	vpnInstanceCount     int           // instances created in VPN mode, used to assign per-replica ports
+	image                string        // Docker image to use
+	dnsServers           []string      // DNS servers to apply to created containers (empty = Docker default)
+	lastPoolActivity     time.Time     // last time any stream was active across the whole pool
+	recycled             bool          // true after a recycle, reset only when a new stream arrives
 	recycleCheckInterval time.Duration // how often recycleIfIdle is checked
 	scaleDownInterval    time.Duration // how often scaleDownIdle is checked
 
@@ -61,7 +62,7 @@ type Orchestrator struct {
 	RecycleTimeout            time.Duration // idle time before recycling the entire pool
 	RecycleCheckInterval      time.Duration // how often the recycle check runs (default 3s)
 	ScaleDownInterval         time.Duration // how often the scale down check runs (default 30s)
-	Profile                   string
+	VPNContainer              string        // name of VPN container whose network namespace instances share (empty = disabled)
 	Image                     string
 	DockerHost                string
 	DNSServers                string // comma-separated DNS servers for AceStream containers
@@ -79,7 +80,7 @@ func (o *Orchestrator) Init() error {
 	o.maxReplicas = o.MaxReplicas
 	o.streamsPerInstance = o.StreamsPerInstance
 	o.idleTimeout = o.IdleTimeout
-	o.profile = o.Profile
+	o.vpnContainer = strings.TrimSpace(o.VPNContainer)
 	o.image = o.Image
 	o.dnsServers = parseDNSServers(o.DNSServers)
 
@@ -127,8 +128,18 @@ func (o *Orchestrator) Init() error {
 		return fmt.Errorf("failed to connect to docker: %w", err)
 	}
 
+	// If a VPN container is configured, verify it exists so misconfiguration
+	// fails fast instead of producing AceStream containers that cannot start.
+	if o.vpnContainer != "" {
+		if _, err := o.dockerClient.ContainerInspect(ctx, o.vpnContainer); err != nil {
+			return fmt.Errorf("vpn container %q not found: %w", o.vpnContainer, err)
+		}
+		slog.Info("VPN container found, AceStream instances will share its network namespace",
+			"vpnContainer", o.vpnContainer)
+	}
+
 	slog.Info("Orchestrator initialized", "minReplicas", o.minReplicas, "maxReplicas", o.maxReplicas,
-		"streamsPerInstance", o.streamsPerInstance, "profile", o.profile, "image", o.image)
+		"streamsPerInstance", o.streamsPerInstance, "vpnContainer", o.vpnName(), "image", o.image)
 
 	// Start initial instances
 	for i := 0; i < o.minReplicas; i++ {
@@ -206,27 +217,29 @@ func (o *Orchestrator) SelectInstance() *AceStreamInstance {
 func (o *Orchestrator) ScaleUp() (*AceStreamInstance, error) {
 	ctx := context.Background()
 
-	slog.Info("Scaling up new AceStream instance", "profile", o.profile, "image", o.image)
+	slog.Info("Scaling up new AceStream instance", "vpnContainer", o.vpnName(), "image", o.image)
 
 	containerID, containerName, host, err := o.createContainer(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 
-	// Container-to-container communication: always use internal port 6878
-	const aceStreamPort = 6878
+	// In VPN mode all instances share the VPN container's network namespace,
+	// so each replica needs its own port (6878, 6879, ...). In regular mode
+	// every container has its own IP, so all instances use 6878.
+	port := o.reservePort()
 
 	instance := &AceStreamInstance{
 		ContainerID:  containerID,
 		Name:         containerName,
 		Host:         host,
-		Port:         aceStreamPort,
+		Port:         port,
 		Health:       Unhealthy,
 		CreatedAt:    time.Now(),
 		LastActivity: time.Now(),
 	}
 
-	slog.Info("Waiting for instance to be healthy", "name", containerName, "host", host, "port", aceStreamPort)
+	slog.Info("Waiting for instance to be healthy", "name", containerName, "host", host, "port", port)
 	if err := o.waitForHealthy(instance); err != nil {
 		// If it never starts, clean up the container
 		_ = o.removeContainer(ctx, containerID)
@@ -240,8 +253,37 @@ func (o *Orchestrator) ScaleUp() (*AceStreamInstance, error) {
 	o.instances[containerID] = instance
 	o.mutex.Unlock()
 
-	slog.Info("New instance ready", "name", containerName, "host", host, "port", aceStreamPort)
+	slog.Info("New instance ready", "name", containerName, "host", host, "port", port)
 	return instance, nil
+}
+
+// reservePort returns the port a new AceStream instance must bind.
+// In regular mode every container has its own IP address, so all instances use 6878.
+// In VPN mode all instances share the VPN container's network namespace, so each
+// replica needs a unique port: 6878 for the first, incrementing by 1 for each new one.
+// A mutex-protected counter is used so concurrent ScaleUp calls never hand out the
+// same port. The counter is reset whenever the whole pool is recycled.
+func (o *Orchestrator) reservePort() int {
+	const aceStreamPort = 6878
+
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	if o.vpnContainer == "" {
+		return aceStreamPort
+	}
+	port := aceStreamPort + o.vpnInstanceCount
+	o.vpnInstanceCount++
+	return port
+}
+
+// vpnName returns the configured VPN container name, or "none" when disabled.
+// Used for logging only.
+func (o *Orchestrator) vpnName() string {
+	if o.vpnContainer == "" {
+		return "none"
+	}
+	return o.vpnContainer
 }
 
 // waitForHealthy polls /webui/api/service?method=get_version
@@ -390,6 +432,8 @@ func (o *Orchestrator) recycleIfIdle() {
 		}
 		delete(o.instances, id)
 	}
+	// The whole pool is gone, so VPN port offsets can restart from 6878.
+	o.vpnInstanceCount = 0
 	// Reset lastPoolActivity before unlocking so that the recycle check does not
 	// fire again immediately while ScaleUp is still running.
 	o.lastPoolActivity = time.Now()

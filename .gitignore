@@ -33,4 +33,5 @@ token-optimizer
 # VSCode files - we don't want those to get pushed to the repo
 .vscode/
 .claude/
+.sdd/
 FEATURES.md

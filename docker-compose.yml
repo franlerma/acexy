@@ -28,7 +28,13 @@ services:
       ACESTREAM_IDLE_TIMEOUT: "10s"
       ACESTREAM_RECYCLE_TIMEOUT: "15s"
       ACESTREAM_IMAGE: "wafy80/acestream:latest"
-      COMPOSE_PROFILE: "regular"
+
+      # VPN routing: empty = regular bridge mode (AceStream instances on their
+      # own IP:6878). Set to a container name (e.g. "warp") to route ALL
+      # AceStream traffic through that container's network namespace. In VPN
+      # mode each replica uses an internal port offset (6878, 6879, ...) because
+      # they share the VPN namespace.
+      # ACESTREAM_VPN_CONTAINER: "warp"
 
       # Docker socket proxy
       DOCKER_HOST: "tcp://docker-proxy:2375"
@@ -55,19 +61,45 @@ services:
       - acexy-orchestrator-network
     restart: unless-stopped
 
-  # Gluetun (opcional, solo necesario con COMPOSE_PROFILE=vpn)
-  # gluetun:
-  #   image: qmcgaw/gluetun
-  #   container_name: gluetun
-  #   cap_add:
-  #     - NET_ADMIN
-  #   environment:
-  #     - VPN_SERVICE_PROVIDER=your_provider
-  #     - VPN_TYPE=openvpn
-  #     # ... resto config VPN
-  #   networks:
-  #     - media-network
-  #   restart: unless-stopped
+  # VPN routing container (Cloudflare WARP). Only used when
+  # ACESTREAM_VPN_CONTAINER=warp is set on the acexy service. AceStream
+  # containers then share this container's network namespace, forcing all their
+  # traffic (including P2P) out through WARP.
+  #
+  # IMPORTANT: namespace sharing requires the VPN container to actually route
+  # traffic. For WARP you MUST enable NAT, otherwise AceStream traffic will NOT
+  # go through the VPN:
+  #   - set WARP_ENABLE_NAT=1
+  #   - uncomment net.ipv4.ip_forward=1 below
+  #     (and net.ipv6.conf.all.forwarding=1 + net.ipv6.conf.all.accept_ra=2 if IPv6)
+  warp:
+    image: caomingjun/warp
+    container_name: warp
+    restart: always
+    # add removed rule back (https://github.com/opencontainers/runc/pull/3468)
+    device_cgroup_rules:
+      - 'c 10:200 rwm'
+    ports:
+      - "1080:1080"
+    environment:
+      - WARP_SLEEP=2
+      # - WARP_LICENSE_KEY= # optional
+      # - WARP_ENABLE_NAT=1 # REQUIRED for acexy namespace sharing
+    cap_add:
+      # Docker already have them, these are for podman users
+      - MKNOD
+      - AUDIT_WRITE
+      # additional required cap for warp, both for podman and docker
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+      # uncomment for nat (REQUIRED for acexy namespace sharing)
+      # - net.ipv4.ip_forward=1
+      # - net.ipv6.conf.all.forwarding=1
+      # - net.ipv6.conf.all.accept_ra=2
+    volumes:
+      - ./data:/var/lib/cloudflare-warp
 
 networks:
   acexy-orchestrator-network:

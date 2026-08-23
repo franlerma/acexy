@@ -127,10 +127,22 @@ You should never mount the Docker socket directly into acexy.
 
 **VPN support:**
 
-Set `COMPOSE_PROFILE=vpn` to route AceStream traffic through a
-[Gluetun](https://github.com/qdm12/gluetun) container. Uncomment the `gluetun` service
-in `docker-compose.yml` and configure your VPN provider. In this mode, AceStream
-instances use Gluetun's network namespace instead of the shared bridge network.
+Set `ACESTREAM_VPN_CONTAINER=<name>` to route **all** AceStream traffic through
+another container (typically a VPN). For example `ACESTREAM_VPN_CONTAINER=warp`
+routes traffic through the `warp` (Cloudflare WARP) service included in
+`docker-compose.yml`. When empty (default), AceStream instances run on the
+shared bridge network with their own IP on port `6878`.
+
+In VPN mode, AceStream containers share the VPN container's **network namespace**
+instead of the bridge network — this is the only way to force AceStream's
+peer-to-peer traffic through the VPN. Because they share the namespace, each
+replica uses an internal port offset (`6878`, `6879`, ...) so that multiple
+instances can coexist.
+
+> **⚠️ The VPN container must actually route traffic.** For the `warp` service,
+> enable NAT (`WARP_ENABLE_NAT=1`) and uncomment `net.ipv4.ip_forward=1` in
+> `docker-compose.yml`; otherwise AceStream traffic will not leave through the
+> VPN.
 
 ## Configuration Options ⚙
 
@@ -297,10 +309,10 @@ experience, but you may need to adjust them to fit your needs.
       <th><code>martinbjeldbak/acestream-http-proxy:latest</code></th>
     </tr>
     <tr>
-      <th><code>-compose-profile</code></th>
-      <th><code>COMPOSE_PROFILE</code></th>
-      <th>Network profile for AceStream containers. Use <code>regular</code> for bridge network or <code>vpn</code> to route through Gluetun.</th>
-      <th><code>regular</code></th>
+      <th><code>-vpn-container</code></th>
+      <th><code>ACESTREAM_VPN_CONTAINER</code></th>
+      <th>Name of a container to route <strong>all</strong> AceStream traffic through via its network namespace (typically a VPN). Empty = regular bridge mode with each instance on its own IP:6878. In VPN mode replicas use internal port offsets (6878, 6879, ...).</th>
+      <th><em>empty</em></th>
     </tr>
     <tr>
       <th><code>-docker-host</code></th>

@@ -23,10 +23,7 @@ func randomHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
-const (
-	defaultRegularNetwork = "bridge"
-	vpnContainer          = "gluetun"
-)
+const defaultRegularNetwork = "bridge"
 
 // containerRemoveOptions returns the standard options for removing containers.
 // containerRemoveOptions returns the standard options for removing containers.
@@ -43,7 +40,8 @@ func isNotFound(err error) bool {
 	return errdefs.IsNotFound(err)
 }
 
-// createContainer creates and starts an AceStream container according to the configured profile.
+// createContainer creates and starts an AceStream container, sharing the VPN
+// container's network namespace when one is configured.
 // Communication is container-to-container on the shared Docker network (internal port 6878).
 // Returns (containerID, containerName, host, error).
 func (o *Orchestrator) createContainer(ctx context.Context) (string, string, string, error) {
@@ -68,22 +66,23 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		AutoRemove:    true, // remove container and its anonymous volumes automatically when it stops
 	}
 
-	if len(o.dnsServers) > 0 {
+	if o.vpnContainer == "" && len(o.dnsServers) > 0 {
 		hostCfg.DNS = o.dnsServers
 	}
 
 	netCfg := &network.NetworkingConfig{}
 
-	if o.profile == "vpn" {
-		// In VPN mode, share the network namespace of the gluetun container
-		hostCfg.NetworkMode = container.NetworkMode(fmt.Sprintf("container:%s", vpnContainer))
+	if o.vpnContainer != "" {
+		// In VPN mode, share the network namespace of the VPN container.
+		// DNS is not injected: it is managed by the shared namespace (the VPN).
+		hostCfg.NetworkMode = container.NetworkMode(fmt.Sprintf("container:%s", o.vpnContainer))
 	}
 
 	if err := o.pullImageIfNeeded(ctx); err != nil {
 		return "", "", "", fmt.Errorf("failed to pull image: %w", err)
 	}
 
-	slog.Debug("Creating container", "name", containerName, "image", o.image, "profile", o.profile)
+	slog.Debug("Creating container", "name", containerName, "image", o.image, "vpnContainer", o.vpnName())
 
 	resp, err := o.dockerClient.ContainerCreate(ctx, cfg, hostCfg, netCfg, nil, containerName)
 	if err != nil {
@@ -96,7 +95,7 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 	}
 
 	// In regular mode, explicitly connect to the network after the container starts
-	if o.profile != "vpn" {
+	if o.vpnContainer == "" {
 		net := o.ContainerNetwork
 		if net == "" {
 			net = defaultRegularNetwork
@@ -134,11 +133,14 @@ func (o *Orchestrator) containerExists(ctx context.Context, containerID string) 
 }
 
 // getContainerHost returns the host to connect to in order to reach the container.
-// In VPN mode it returns "localhost" (shared network with gluetun).
+// In VPN mode it returns the IP of the VPN container: AceStream instances share
+// the VPN container's network namespace, so they are reachable through its IP on
+// the configured network (which is where acexy can reach them too). The instance
+// container itself has no IP of its own.
 // In regular mode it returns the container IP on the configured network.
 func (o *Orchestrator) getContainerHost(ctx context.Context, containerID string) (string, error) {
-	if o.profile == "vpn" {
-		return "localhost", nil
+	if o.vpnContainer != "" {
+		return o.vpnContainerHost(ctx)
 	}
 
 	inspect, err := o.dockerClient.ContainerInspect(ctx, containerID)
@@ -162,6 +164,33 @@ func (o *Orchestrator) getContainerHost(ctx context.Context, containerID string)
 	}
 
 	return "", fmt.Errorf("could not determine IP for container %s", containerID[:12])
+}
+
+// vpnContainerHost returns the IP of the VPN container on the configured network.
+// AceStream instances share the VPN container's network namespace, so acexy must
+// reach them through the VPN container's IP rather than "localhost" (acexy itself
+// lives in a different network namespace).
+func (o *Orchestrator) vpnContainerHost(ctx context.Context) (string, error) {
+	inspect, err := o.dockerClient.ContainerInspect(ctx, o.vpnContainer)
+	if err != nil {
+		return "", fmt.Errorf("failed to inspect VPN container %q: %w", o.vpnContainer, err)
+	}
+
+	net := o.ContainerNetwork
+	if net == "" {
+		net = defaultRegularNetwork
+	}
+	if netSettings, ok := inspect.NetworkSettings.Networks[net]; ok {
+		if netSettings.IPAddress != "" {
+			return netSettings.IPAddress, nil
+		}
+	}
+
+	if inspect.NetworkSettings.IPAddress != "" {
+		return inspect.NetworkSettings.IPAddress, nil
+	}
+
+	return "", fmt.Errorf("could not determine IP for VPN container %q", o.vpnContainer)
 }
 
 // pullImageIfNeeded checks whether the image is available locally and pulls it if not.
