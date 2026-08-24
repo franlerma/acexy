@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/errdefs"
 )
 
@@ -40,8 +42,10 @@ func isNotFound(err error) bool {
 	return errdefs.IsNotFound(err)
 }
 
-// createContainer creates and starts an AceStream container, sharing the VPN
-// container's network namespace when one is configured.
+// createContainer creates and starts an AceStream container. When a VPN
+// container is configured, the instance routes its bootstrap traffic through
+// it and switches back to the normal network after a delay (done by the
+// acestream-vpn-switch image entrypoint).
 // Communication is container-to-container on the shared Docker network (internal port 6878).
 // Returns (containerID, containerName, host, error).
 func (o *Orchestrator) createContainer(ctx context.Context) (string, string, string, error) {
@@ -66,16 +70,21 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		AutoRemove:    true, // remove container and its anonymous volumes automatically when it stops
 	}
 
-	if o.vpnContainer == "" && len(o.dnsServers) > 0 {
+	if len(o.dnsServers) > 0 {
 		hostCfg.DNS = o.dnsServers
 	}
 
 	netCfg := &network.NetworkingConfig{}
 
 	if o.vpnContainer != "" {
-		// In VPN mode, share the network namespace of the VPN container.
-		// DNS is not injected: it is managed by the shared namespace (the VPN).
-		hostCfg.NetworkMode = container.NetworkMode(fmt.Sprintf("container:%s", o.vpnContainer))
+		// In VPN mode the instance runs on the normal bridge network (its own IP)
+		// but needs NET_ADMIN so the acestream-vpn-switch entrypoint can change
+		// the default route at runtime (VPN -> normal).
+		hostCfg.CapAdd = strslice.StrSlice{"NET_ADMIN"}
+		cfg.Env = []string{
+			"ACESTREAM_VPN_CONTAINER=" + o.vpnContainer,
+			"ACESTREAM_VPN_SWITCH_AFTER=" + strconv.Itoa(int(o.vpnSwitchAfter.Seconds())),
+		}
 	}
 
 	if err := o.pullImageIfNeeded(ctx); err != nil {
@@ -94,18 +103,16 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		return "", "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// In regular mode, explicitly connect to the network after the container starts
-	if o.vpnContainer == "" {
-		net := o.ContainerNetwork
-		if net == "" {
-			net = defaultRegularNetwork
-		}
-		if err := o.dockerClient.NetworkConnect(ctx, net, resp.ID, &network.EndpointSettings{}); err != nil {
-			_ = o.dockerClient.ContainerRemove(ctx, resp.ID, containerRemoveOptions())
-			return "", "", "", fmt.Errorf("failed to connect container to network %s: %w", net, err)
-		}
-		slog.Debug("Container connected to network", "network", net, "containerID", resp.ID[:12])
+	// Connect to the network after the container starts (every mode has its own IP)
+	net := o.ContainerNetwork
+	if net == "" {
+		net = defaultRegularNetwork
 	}
+	if err := o.dockerClient.NetworkConnect(ctx, net, resp.ID, &network.EndpointSettings{}); err != nil {
+		_ = o.dockerClient.ContainerRemove(ctx, resp.ID, containerRemoveOptions())
+		return "", "", "", fmt.Errorf("failed to connect container to network %s: %w", net, err)
+	}
+	slog.Debug("Container connected to network", "network", net, "containerID", resp.ID[:12])
 
 	// Get the container's IP on the correct network
 	host, err := o.getContainerHost(ctx, resp.ID)
@@ -133,16 +140,9 @@ func (o *Orchestrator) containerExists(ctx context.Context, containerID string) 
 }
 
 // getContainerHost returns the host to connect to in order to reach the container.
-// In VPN mode it returns the IP of the VPN container: AceStream instances share
-// the VPN container's network namespace, so they are reachable through its IP on
-// the configured network (which is where acexy can reach them too). The instance
-// container itself has no IP of its own.
-// In regular mode it returns the container IP on the configured network.
+// Every instance runs on the shared bridge network with its own IP, so this
+// returns the container IP on the configured network.
 func (o *Orchestrator) getContainerHost(ctx context.Context, containerID string) (string, error) {
-	if o.vpnContainer != "" {
-		return o.vpnContainerHost(ctx)
-	}
-
 	inspect, err := o.dockerClient.ContainerInspect(ctx, containerID)
 	if err != nil {
 		return "", fmt.Errorf("failed to inspect container: %w", err)
@@ -164,33 +164,6 @@ func (o *Orchestrator) getContainerHost(ctx context.Context, containerID string)
 	}
 
 	return "", fmt.Errorf("could not determine IP for container %s", containerID[:12])
-}
-
-// vpnContainerHost returns the IP of the VPN container on the configured network.
-// AceStream instances share the VPN container's network namespace, so acexy must
-// reach them through the VPN container's IP rather than "localhost" (acexy itself
-// lives in a different network namespace).
-func (o *Orchestrator) vpnContainerHost(ctx context.Context) (string, error) {
-	inspect, err := o.dockerClient.ContainerInspect(ctx, o.vpnContainer)
-	if err != nil {
-		return "", fmt.Errorf("failed to inspect VPN container %q: %w", o.vpnContainer, err)
-	}
-
-	net := o.ContainerNetwork
-	if net == "" {
-		net = defaultRegularNetwork
-	}
-	if netSettings, ok := inspect.NetworkSettings.Networks[net]; ok {
-		if netSettings.IPAddress != "" {
-			return netSettings.IPAddress, nil
-		}
-	}
-
-	if inspect.NetworkSettings.IPAddress != "" {
-		return inspect.NetworkSettings.IPAddress, nil
-	}
-
-	return "", fmt.Errorf("could not determine IP for VPN container %q", o.vpnContainer)
 }
 
 // pullImageIfNeeded checks whether the image is available locally and pulls it if not.

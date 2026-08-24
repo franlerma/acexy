@@ -45,8 +45,8 @@ type Orchestrator struct {
 	maxReplicas          int
 	streamsPerInstance   int
 	idleTimeout          time.Duration
-	vpnContainer         string        // name of VPN container to share network namespace with (empty = disabled)
-	vpnInstanceCount     int           // instances created in VPN mode, used to assign per-replica ports
+	vpnContainer         string        // name of VPN container to route bootstrap traffic through (empty = disabled)
+	vpnSwitchAfter       time.Duration // seconds before switching from VPN back to normal network
 	image                string        // Docker image to use
 	dnsServers           []string      // DNS servers to apply to created containers (empty = Docker default)
 	lastPoolActivity     time.Time     // last time any stream was active across the whole pool
@@ -62,7 +62,8 @@ type Orchestrator struct {
 	RecycleTimeout            time.Duration // idle time before recycling the entire pool
 	RecycleCheckInterval      time.Duration // how often the recycle check runs (default 3s)
 	ScaleDownInterval         time.Duration // how often the scale down check runs (default 30s)
-	VPNContainer              string        // name of VPN container whose network namespace instances share (empty = disabled)
+	VPNContainer              string        // name of VPN container instances route bootstrap traffic through (empty = disabled)
+	VPNSwitchAfter            time.Duration // seconds before instances switch from VPN to normal network
 	Image                     string
 	DockerHost                string
 	DNSServers                string // comma-separated DNS servers for AceStream containers
@@ -81,6 +82,7 @@ func (o *Orchestrator) Init() error {
 	o.streamsPerInstance = o.StreamsPerInstance
 	o.idleTimeout = o.IdleTimeout
 	o.vpnContainer = strings.TrimSpace(o.VPNContainer)
+	o.vpnSwitchAfter = o.VPNSwitchAfter
 	o.image = o.Image
 	o.dnsServers = parseDNSServers(o.DNSServers)
 
@@ -134,7 +136,7 @@ func (o *Orchestrator) Init() error {
 		if _, err := o.dockerClient.ContainerInspect(ctx, o.vpnContainer); err != nil {
 			return fmt.Errorf("vpn container %q not found: %w", o.vpnContainer, err)
 		}
-		slog.Info("VPN container found, AceStream instances will share its network namespace",
+		slog.Info("VPN container found, AceStream instances will route bootstrap traffic through it",
 			"vpnContainer", o.vpnContainer)
 	}
 
@@ -224,9 +226,6 @@ func (o *Orchestrator) ScaleUp() (*AceStreamInstance, error) {
 		return nil, fmt.Errorf("failed to create container: %w", err)
 	}
 
-	// In VPN mode all instances share the VPN container's network namespace,
-	// so each replica needs its own port (6878, 6879, ...). In regular mode
-	// every container has its own IP, so all instances use 6878.
 	port := o.reservePort()
 
 	instance := &AceStreamInstance{
@@ -258,23 +257,11 @@ func (o *Orchestrator) ScaleUp() (*AceStreamInstance, error) {
 }
 
 // reservePort returns the port a new AceStream instance must bind.
-// In regular mode every container has its own IP address, so all instances use 6878.
-// In VPN mode all instances share the VPN container's network namespace, so each
-// replica needs a unique port: 6878 for the first, incrementing by 1 for each new one.
-// A mutex-protected counter is used so concurrent ScaleUp calls never hand out the
-// same port. The counter is reset whenever the whole pool is recycled.
+// Every instance runs on the shared bridge network with its own IP, so all
+// instances use the same internal port 6878.
 func (o *Orchestrator) reservePort() int {
 	const aceStreamPort = 6878
-
-	o.mutex.Lock()
-	defer o.mutex.Unlock()
-
-	if o.vpnContainer == "" {
-		return aceStreamPort
-	}
-	port := aceStreamPort + o.vpnInstanceCount
-	o.vpnInstanceCount++
-	return port
+	return aceStreamPort
 }
 
 // vpnName returns the configured VPN container name, or "none" when disabled.
@@ -432,8 +419,6 @@ func (o *Orchestrator) recycleIfIdle() {
 		}
 		delete(o.instances, id)
 	}
-	// The whole pool is gone, so VPN port offsets can restart from 6878.
-	o.vpnInstanceCount = 0
 	// Reset lastPoolActivity before unlocking so that the recycle check does not
 	// fire again immediately while ScaleUp is still running.
 	o.lastPoolActivity = time.Now()

@@ -46,6 +46,7 @@ var (
 	recycleCheckInterval      time.Duration
 	scaleDownInterval         time.Duration
 	vpnContainer              string
+	vpnSwitchAfter            time.Duration
 	acestreamImage            string
 	acestreamDNSServers       string
 	dockerHost                string
@@ -455,8 +456,15 @@ func parseArgs() {
 		&vpnContainer,
 		"vpn-container",
 		LookupEnvOrString("ACESTREAM_VPN_CONTAINER", ""),
-		"name of the VPN container whose network namespace all AceStream instances will share. "+
+		"name of the VPN container through which AceStream instances route their bootstrap traffic. "+
 			"Empty = regular bridge networking. Can be set with ACESTREAM_VPN_CONTAINER environment variable",
+	)
+	flag.DurationVar(
+		&vpnSwitchAfter,
+		"vpn-switch-after",
+		LookupEnvOrDuration("ACESTREAM_VPN_SWITCH_AFTER", 45*time.Second),
+		"time before AceStream instances switch their traffic from the VPN back to the normal network. "+
+			"Can be set with ACESTREAM_VPN_SWITCH_AFTER environment variable",
 	)
 	flag.StringVar(
 		&acestreamImage,
@@ -519,6 +527,7 @@ func main() {
 		RecycleCheckInterval:      recycleCheckInterval,
 		ScaleDownInterval:         scaleDownInterval,
 		VPNContainer:              vpnContainer,
+		VPNSwitchAfter:            vpnSwitchAfter,
 		Image:                     acestreamImage,
 		DockerHost:                dockerHost,
 		DNSServers:                acestreamDNSServers,
