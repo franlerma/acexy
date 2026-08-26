@@ -74,7 +74,22 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		hostCfg.DNS = o.dnsServers
 	}
 
-	netCfg := &network.NetworkingConfig{}
+	// Determine the network to attach the instance to. This is the compose
+	// network where acexy itself lives, so the instance is reachable by acexy
+	// and (in VPN mode) by the VPN container on the same network.
+	net := o.ContainerNetwork
+	if net == "" {
+		net = defaultRegularNetwork
+	}
+
+	// Attach to the network directly at creation time so the container does NOT
+	// end up on the default "bridge" network as well (which would give it two
+	// interfaces and a default route pointing at the wrong gateway).
+	netCfg := &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{
+			net: {},
+		},
+	}
 
 	if o.vpnContainer != "" {
 		// In VPN mode the instance runs on the normal bridge network (its own IP)
@@ -103,16 +118,7 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		return "", "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Connect to the network after the container starts (every mode has its own IP)
-	net := o.ContainerNetwork
-	if net == "" {
-		net = defaultRegularNetwork
-	}
-	if err := o.dockerClient.NetworkConnect(ctx, net, resp.ID, &network.EndpointSettings{}); err != nil {
-		_ = o.dockerClient.ContainerRemove(ctx, resp.ID, containerRemoveOptions())
-		return "", "", "", fmt.Errorf("failed to connect container to network %s: %w", net, err)
-	}
-	slog.Debug("Container connected to network", "network", net, "containerID", resp.ID[:12])
+	slog.Debug("Container created on network", "network", net, "containerID", resp.ID[:12])
 
 	// Get the container's IP on the correct network
 	host, err := o.getContainerHost(ctx, resp.ID)
