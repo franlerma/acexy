@@ -469,7 +469,7 @@ func parseArgs() {
 	flag.StringVar(
 		&acestreamImage,
 		"acestream-image",
-		LookupEnvOrString("ACESTREAM_IMAGE", "martinbjeldbak/acestream-http-proxy:latest"),
+		LookupEnvOrString("ACESTREAM_IMAGE", "franlerma/acestream-vpn-switch:latest"),
 		"Docker image to use for AceStream instances. Can be set with ACESTREAM_IMAGE environment variable",
 	)
 	flag.StringVar(
