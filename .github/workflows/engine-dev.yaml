@@ -9,7 +9,7 @@ on:
 
 env:
     REGISTRY: ghcr.io
-    GHCR_ENGINE_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/acestream-vpn-switch
+    GHCR_ENGINE_IMAGE: ghcr.io/${{ github.repository_owner }}/acestream-vpn-switch
     DOCKERHUB_ENGINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acestream-vpn-switch
 
 jobs:
