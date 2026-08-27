@@ -305,8 +305,8 @@ experience, but you may need to adjust them to fit your needs.
     <tr>
       <th><code>-acestream-image</code></th>
       <th><code>ACESTREAM_IMAGE</code></th>
-      <th>Docker image to use for AceStream instances.</th>
-      <th><code>martinbjeldbak/acestream-http-proxy:latest</code></th>
+      <th>Docker image to use for AceStream instances. If unset, defaults to the bundled custom engine <code>franlerma/acestream-vpn-switch:latest</code> (VPN routing + normal network switch).</th>
+      <th><code>franlerma/acestream-vpn-switch:latest</code></th>
     </tr>
     <tr>
       <th><code>-vpn-container</code></th>

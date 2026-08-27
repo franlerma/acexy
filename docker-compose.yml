@@ -27,7 +27,6 @@ services:
       ACESTREAM_STREAMS_PER_INSTANCE: "2"
       ACESTREAM_IDLE_TIMEOUT: "10s"
       ACESTREAM_RECYCLE_TIMEOUT: "15s"
-      ACESTREAM_IMAGE: "wafy80/acestream:latest"
 
       # VPN routing: empty = regular bridge mode (AceStream instances on their
       # own IP:6878). Set to a container name (e.g. "warp") to route ALL

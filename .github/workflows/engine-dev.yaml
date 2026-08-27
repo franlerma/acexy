@@ -1,21 +1,19 @@
-name: Publish dev Docker image
+name: Publish engine dev image
 
 on:
     push:
         branches: [main]
         paths:
-            - 'acexy/**'
-            - 'Dockerfile'
-            - '.github/workflows/docker-dev.yaml'
+            - 'engine/**'
     workflow_dispatch:
 
 env:
     REGISTRY: ghcr.io
     IMAGE_NAME: ${{ github.repository }}
-    DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acexy
+    DOCKERHUB_ENGINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acestream-vpn-switch
 
 jobs:
-    build-and-push-image:
+    build-engine-dev:
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -48,14 +46,15 @@ jobs:
             - name: Set up Docker Buildx
               uses: docker/setup-buildx-action@v3
 
-            - name: Build and push the Docker image
+            - name: Build and push the engine dev image
               uses: docker/build-push-action@v6
               with:
-                context: .
+                context: ./engine
+                file: ./engine/Dockerfile
                 platforms: linux/amd64,linux/arm64,linux/arm/v7
                 push: true
                 tags: |
-                  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:dev
-                  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sha.outputs.short }}
-                  ${{ env.DOCKERHUB_IMAGE }}:dev
-                  ${{ env.DOCKERHUB_IMAGE }}:${{ steps.sha.outputs.short }}
+                  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/engine:dev
+                  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/engine:${{ steps.sha.outputs.short }}
+                  ${{ env.DOCKERHUB_ENGINE_IMAGE }}:dev
+                  ${{ env.DOCKERHUB_ENGINE_IMAGE }}:${{ steps.sha.outputs.short }}
