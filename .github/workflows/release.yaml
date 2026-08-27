@@ -7,6 +7,7 @@ env:
     REGISTRY: ghcr.io
     IMAGE_NAME: ${{ github.repository }}
     DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acexy
+    GHCR_ENGINE_IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/acestream-vpn-switch
     DOCKERHUB_ENGINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acestream-vpn-switch
 
 jobs:
@@ -51,7 +52,7 @@ jobs:
               uses: docker/metadata-action@v5
               with:
                 images: |
-                  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/engine
+                  ${{ env.GHCR_ENGINE_IMAGE }}
                   ${{ env.DOCKERHUB_ENGINE_IMAGE }}
                 flavor: |
                   latest=${{ !github.event.release.prerelease }}
@@ -95,7 +96,7 @@ jobs:
             - name: Generate artifact attestation for the engine
               uses: actions/attest-build-provenance@v1
               with:
-                subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/engine
+                subject-name: ${{ env.GHCR_ENGINE_IMAGE }}
                 subject-digest: ${{ steps.push-engine.outputs.digest }}
                 push-to-registry: true
 
@@ -106,4 +107,4 @@ jobs:
                 id: ${{ github.event.release.id }}
                 body: |
                   `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tags }}`
-                  `docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/engine:${{ steps.meta-engine.outputs.tags }}`
+                  `docker pull ${{ env.GHCR_ENGINE_IMAGE }}:${{ steps.meta-engine.outputs.tags }}`
