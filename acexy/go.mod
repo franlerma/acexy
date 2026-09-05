@@ -1,6 +1,6 @@
 module javinator9889/acexy
 
-go 1.24.0
+go 1.27.1
 
 require github.com/google/uuid v1.6.0 // direct
 

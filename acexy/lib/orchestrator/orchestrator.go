@@ -195,10 +195,17 @@ func (o *Orchestrator) WaitForInstance(timeout time.Duration) *AceStreamInstance
 // - ActiveStreams < streamsPerInstance
 // - Prefers the instance with the most active streams (bin-packing strategy)
 // Returns nil if no instance is available.
+// NOTE: this is read-only and does NOT reserve capacity. Use ReserveInstance when assigning
+// a new stream so that the selection and the ActiveStreams increment are atomic.
 func (o *Orchestrator) SelectInstance() *AceStreamInstance {
 	o.mutex.RLock()
 	defer o.mutex.RUnlock()
+	return o.pickBestLocked()
+}
 
+// pickBestLocked returns the best available instance with capacity.
+// The caller must hold o.mutex (read or write).
+func (o *Orchestrator) pickBestLocked() *AceStreamInstance {
 	var best *AceStreamInstance
 	for _, inst := range o.instances {
 		if inst.Health != Healthy {
@@ -212,6 +219,65 @@ func (o *Orchestrator) SelectInstance() *AceStreamInstance {
 		}
 	}
 	return best
+}
+
+// ReserveInstance atomically selects the best available instance with capacity AND increments
+// its ActiveStreams, so two concurrent stream assignments cannot oversubscribe an instance.
+// Returns nil if no instance is available (nothing reserved). Caller must NOT hold o.mutex.
+func (o *Orchestrator) ReserveInstance() *AceStreamInstance {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+
+	best := o.pickBestLocked()
+	if best == nil {
+		return nil
+	}
+	best.ActiveStreams++
+	best.LastActivity = time.Now()
+	return best
+}
+
+// ReserveExisting increments ActiveStreams on a specific, already-selected instance. Used after
+// ScaleUp (fresh instance with ActiveStreams == 0) or WaitForInstance. Atomic under o.mutex.
+func (o *Orchestrator) ReserveExisting(inst *AceStreamInstance) {
+	if inst == nil {
+		return
+	}
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	inst.ActiveStreams++
+	inst.LastActivity = time.Now()
+}
+
+// ReleaseInstance decrements ActiveStreams on an instance (clamped at 0) and updates activity.
+// Used when a stream's fetch fails or when its last client leaves.
+func (o *Orchestrator) ReleaseInstance(inst *AceStreamInstance) {
+	if inst == nil {
+		return
+	}
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	if inst.ActiveStreams > 0 {
+		inst.ActiveStreams--
+	}
+	inst.LastActivity = time.Now()
+}
+
+// TransferStream atomically moves one unit of ActiveStreams accounting from one instance to
+// another (used when migrating a stream off an unhealthy instance). Clamps the source at 0.
+func (o *Orchestrator) TransferStream(from, to *AceStreamInstance) {
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	if from != nil && from.ActiveStreams > 0 {
+		from.ActiveStreams--
+	}
+	if to != nil {
+		to.ActiveStreams++
+		to.LastActivity = time.Now()
+	}
+	if from != nil {
+		from.LastActivity = time.Now()
+	}
 }
 
 // ScaleUp creates a new AceStream container, waits for it to become healthy,
