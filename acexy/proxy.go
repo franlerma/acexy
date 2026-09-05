@@ -35,6 +35,7 @@ var (
 	emptyTimeout      time.Duration
 	emptyRetryCount   int
 	size              Size
+	clientBufferSize  Size
 	noResponseTimeout time.Duration
 
 	// Orchestrator config
@@ -266,6 +267,20 @@ func LookupEnvOrSize(key string, def uint64) *Size {
 	return &size
 }
 
+// lookupClientBufferSize reads ACEXY_CLIENT_BUFFER_SIZE (human-readable) into clientBufferSize,
+// defaulting to 16 MiB when unset. This is an upper bound per client, not a pre-allocation.
+func lookupClientBufferSize() uint64 {
+	def := uint64(16 << 20)
+	if val, ok := os.LookupEnv("ACEXY_CLIENT_BUFFER_SIZE"); ok {
+		if err := clientBufferSize.Set(val); err != nil {
+			slog.Error("Failed to parse environment variable", "key", "ACEXY_CLIENT_BUFFER_SIZE", "value", val)
+			return def
+		}
+		return clientBufferSize.Bytes
+	}
+	return def
+}
+
 func (s *Size) Set(value string) error {
 	size, err := humanize.ParseBytes(value)
 	if err != nil {
@@ -401,6 +416,15 @@ func parseArgs() {
 		"buffer size in human-readable format to use when copying the data. "+
 			"Can be set with ACEXY_BUFFER_SIZE environment variable",
 	)
+	flag.Var(
+		&clientBufferSize,
+		"client-buffer-size",
+		"maximum bytes buffered per client in the fan-out before oldest data is dropped (lossy "+
+			"upper bound, allocated on demand, not pre-reserved). "+
+			"Can be set with ACEXY_CLIENT_BUFFER_SIZE environment variable",
+	)
+	// Apply the env/default before flag.Parse so an unset flag keeps the configured value.
+	clientBufferSize.Bytes = lookupClientBufferSize()
 	flag.DurationVar(
 		&noResponseTimeout,
 		"no-response-timeout",
@@ -553,6 +577,7 @@ func main() {
 		EmptyTimeout:      emptyTimeout,
 		EmptyRetryCount:   emptyRetryCount,
 		BufferSize:        int(size.Bytes),
+		ClientBufferSize:  int(clientBufferSize.Bytes),
 		NoResponseTimeout: noResponseTimeout,
 		Orchestrator:      orch,
 	}
@@ -571,7 +596,15 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
-	server := &http.Server{Addr: addr, Handler: mux}
+	// ReadTimeout and WriteTimeout are deliberately left at 0: this is a streaming proxy
+	// (MPEG-TS / HLS) that serves infinite responses, so a write timeout would cut streams.
+	// ReadHeaderTimeout and IdleTimeout are safe hardening against slowloris/lingering conns.
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
 
 	go func() {
 		<-stop

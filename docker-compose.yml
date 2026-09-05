@@ -4,7 +4,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: acexy-orchestrator
     restart: unless-stopped
     ports:
       - "8080:8080/tcp"
@@ -29,7 +28,7 @@ services:
       ACESTREAM_RECYCLE_TIMEOUT: "15s"
 
       # VPN routing: empty = regular bridge mode (AceStream instances on their
-      # own IP:6878). Set to a container name (e.g. "warp") to route ALL
+      # own IP:6878). Set to a service name (e.g. "warp") to route ALL
       # AceStream traffic through that container's network namespace. In VPN
       # mode each replica uses an internal port offset (6878, 6879, ...) because
       # they share the VPN namespace.
@@ -45,7 +44,6 @@ services:
 
   docker-proxy:
     image: tecnativa/docker-socket-proxy
-    container_name: docker-proxy
     privileged: true
     environment:
       CONTAINERS: 1
@@ -61,7 +59,7 @@ services:
     restart: unless-stopped
 
   # VPN routing container (Cloudflare WARP). Only used when
-  # ACESTREAM_VPN_CONTAINER=warp is set on the acexy service. AceStream
+  # ACESTREAM_VPN_CONTAINER=warp (service name) is set on the acexy service. AceStream
   # containers then share this container's network namespace, forcing all their
   # traffic (including P2P) out through WARP.
   #
@@ -73,7 +71,6 @@ services:
   #     (and net.ipv6.conf.all.forwarding=1 + net.ipv6.conf.all.accept_ra=2 if IPv6)
   warp:
     image: caomingjun/warp
-    container_name: warp
     restart: always
     # add removed rule back (https://github.com/opencontainers/runc/pull/3468)
     device_cgroup_rules:
@@ -104,3 +101,7 @@ networks:
   acexy-orchestrator-network:
     name: acexy-orchestrator-network
     driver: bridge
+
+# Project name — all resources (containers, network, volumes) are prefixed
+# "acexy-*", so they never collide with same-named resources from other stacks.
+name: acexy

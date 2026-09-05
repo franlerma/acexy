@@ -63,6 +63,10 @@ type AceStream struct {
 	ID          AceID
 }
 
+// ongoingStream holds all per-stream state. Its fields are protected by the global
+// Acexy.mutex. Network I/O is NEVER performed while holding that mutex; the fetchDone /
+// bootStarting gates make sure a slow engine only blocks the stream it belongs to, not the
+// whole proxy.
 type ongoingStream struct {
 	clients  uint
 	done     chan struct{}
@@ -71,6 +75,17 @@ type ongoingStream struct {
 	copier   *Copier
 	writers  *pmw.PMultiWriter
 	instance *orchestrator.AceStreamInstance // nil if orchestration is disabled
+
+	// fetchDone is non-nil (open channel) only while this stream is being enqueued by a
+	// FetchStream goroutine. Concurrent callers wait on it and then re-check the map.
+	// fetchDone is closed and set to nil once the fetch completes (success or failure).
+	fetchDone chan struct{}
+
+	// playback boot single-flight: only one StartStream goroutine issues the a.middleware.Get
+	// for a fresh stream; the rest wait on bootDone.
+	bootStarting bool
+	bootDone     chan struct{}
+	bootErr      error
 }
 
 // Structure referencing the AceStream Proxy - this is, ourselves
@@ -82,8 +97,10 @@ type Acexy struct {
 	EmptyTimeout      time.Duration // Timeout after which, if no data is written, the stream is closed
 	EmptyRetryCount   int           // Number of reconnect attempts when a stream stalls (0 = no retry)
 	BufferSize        int           // The buffer size to use when copying the data
+	ClientBufferSize  int           // Max bytes buffered per client in the fan-out (lossy upper bound)
 	NoResponseTimeout time.Duration // Timeout to wait for a response from the AceStream middleware
-	Orchestrator      *orchestrator.Orchestrator // nil if dynamic orchestration is disabled
+
+	Orchestrator *orchestrator.Orchestrator // nil if dynamic orchestration is disabled
 
 	// Information about ongoing streams
 	streams    map[AceID]*ongoingStream
@@ -124,63 +141,70 @@ func (a *Acexy) Init() {
 // the same time through the middleware. When the last client finishes, the stream is removed.
 // The stream is identified by the “id“ identifier. Optionally, takes extra parameters to
 // customize the stream.
+//
+// The network I/O (instance acquisition + getstream against the engine) happens OUTSIDE the
+// global mutex. A single-flight "starting" placeholder is registered so a second client for the
+// same new stream waits and reuses it instead of enqueuing it twice.
 func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, error) {
-	a.mutex.Lock()
-	defer a.mutex.Unlock()
+	var os *ongoingStream
 
-	// Check if the stream is already enqueued — instances are untouched, the PMultiWriter handles distribution
-	if stream, ok := a.streams[aceId]; ok {
-		return stream.stream, nil
+	// Fast paths and placeholder reservation happen under a short lock.
+	for {
+		a.mutex.Lock()
+		cur, ok := a.streams[aceId]
+		if ok && cur.fetchDone == nil {
+			// Fully enqueued entry (live or idle-but-registered): reuse it.
+			stream := cur.stream
+			a.mutex.Unlock()
+			return stream, nil
+		}
+		if ok && cur.fetchDone != nil {
+			// Another goroutine is fetching this stream. Wait for it, then re-check.
+			done := cur.fetchDone
+			a.mutex.Unlock()
+			<-done
+			continue
+		}
+		// Not present: we become the starter. Reserve a placeholder and fetch outside the lock.
+		os = &ongoingStream{
+			clients:   0,
+			done:      make(chan struct{}),
+			writers:   pmw.New(),
+			fetchDone: make(chan struct{}),
+		}
+		os.writers.SetBufferSize(a.ClientBufferSize)
+		a.streams[aceId] = os
+		a.mutex.Unlock()
+		break
 	}
 
-	// Select instance via orchestrator or fall back to the static backend
+	// ---- Network + instance acquisition OUTSIDE the global mutex ----
 	var middlewareResp *AceStreamMiddleware
-	var err error
 	var instance *orchestrator.AceStreamInstance
+	var err error
 
 	if a.Orchestrator != nil {
-		instance = a.Orchestrator.SelectInstance()
-		if instance == nil {
-			if a.Orchestrator.IsRecycling() {
-				// Pool is being recycled — wait for a fresh instance instead of creating a new one
-				slog.Info("Pool is recycling, waiting for a healthy instance")
-				instance = a.Orchestrator.WaitForInstance(2 * time.Minute)
-				if instance == nil {
-					return nil, errors.New("timed out waiting for instance after pool recycle")
-				}
-			} else if a.Orchestrator.TotalInstances() < a.Orchestrator.MaxReplicas {
-				instance, err = a.Orchestrator.ScaleUp()
-				if err != nil {
-					slog.Error("Failed to scale up", "error", err)
-					return nil, fmt.Errorf("failed to scale up new instance: %w", err)
-				}
-			} else {
-				return nil, errors.New("max replicas reached, no instance available")
-			}
+		instance, err = a.acquireInstance()
+		if err != nil {
+			a.failFetch(aceId, os)
+			return nil, err
 		}
-		// Increment before the request to avoid a race condition:
-		// if two streams arrive simultaneously, the second will already see ActiveStreams=1
-		instance.ActiveStreams++
-		instance.LastActivity = time.Now()
-		a.Orchestrator.TouchPoolActivity()
-		slog.Debug("Instance stream count", "instance", instance.Name,
-			"activeStreams", instance.ActiveStreams)
-
 		middlewareResp, err = GetStreamFromInstance(instance, a, aceId, extraParams)
 		if err != nil {
-			// Revert if the request fails
-			instance.ActiveStreams--
+			a.Orchestrator.ReleaseInstance(instance)
+			a.failFetch(aceId, os)
+			slog.Error("Error getting stream from instance", "error", err)
+			return nil, err
 		}
 	} else {
 		middlewareResp, err = GetStream(a, aceId, extraParams)
+		if err != nil {
+			a.failFetch(aceId, os)
+			slog.Error("Error getting stream middleware", "error", err)
+			return nil, err
+		}
 	}
 
-	if err != nil {
-		slog.Error("Error getting stream middleware", "error", err)
-		return nil, err
-	}
-
-	// We got the stream information, build the structure around it and register the stream
 	slog.Debug("Middleware Information", "id", aceId, "middleware", middlewareResp)
 	stream := &AceStream{
 		PlaybackURL: middlewareResp.Response.PlaybackURL,
@@ -189,86 +213,221 @@ func (a *Acexy) FetchStream(aceId AceID, extraParams url.Values) (*AceStream, er
 		ID:          aceId,
 	}
 
-	a.streams[aceId] = &ongoingStream{
-		clients:  0,
-		done:     make(chan struct{}),
-		player:   nil,
-		stream:   stream,
-		writers:  pmw.New(),
-		instance: instance,
+	// Finalize under a short lock: attach the result and wake any waiters.
+	a.mutex.Lock()
+	os.stream = stream
+	os.instance = instance
+	done := os.fetchDone
+	os.fetchDone = nil
+	if done != nil {
+		close(done)
 	}
+	a.mutex.Unlock()
 	return stream, nil
 }
 
-func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
+// failFetch removes the "starting" placeholder registered by this FetchStream and wakes any
+// waiters. Waiters that wake and find the entry gone become starters themselves and retry.
+func (a *Acexy) failFetch(aceId AceID, os *ongoingStream) {
 	a.mutex.Lock()
-	defer a.mutex.Unlock()
+	if cur, ok := a.streams[aceId]; ok && cur == os {
+		delete(a.streams, aceId)
+	}
+	done := os.fetchDone
+	os.fetchDone = nil
+	if done != nil {
+		close(done)
+	}
+	a.mutex.Unlock()
+}
 
-	// Get the ongoing stream
-	ongoingStream, ok := a.streams[stream.ID]
+// acquireInstance selects an instance with capacity and reserves it atomically, scaling up or
+// waiting for a recycled pool when none is available. The caller (FetchStream / migrateStream)
+// must release the reservation via ReleaseInstance if the subsequent request fails.
+// Must NOT be called while holding Acexy.mutex.
+func (a *Acexy) acquireInstance() (*orchestrator.AceStreamInstance, error) {
+	if instance := a.Orchestrator.ReserveInstance(); instance != nil {
+		return instance, nil
+	}
+
+	if a.Orchestrator.IsRecycling() {
+		slog.Info("Pool is recycling, waiting for a healthy instance")
+		instance := a.Orchestrator.WaitForInstance(2 * time.Minute)
+		if instance == nil {
+			return nil, errors.New("timed out waiting for instance after pool recycle")
+		}
+		a.Orchestrator.ReserveExisting(instance)
+		return instance, nil
+	}
+
+	if a.Orchestrator.TotalInstances() < a.Orchestrator.MaxReplicas {
+		instance, err := a.Orchestrator.ScaleUp()
+		if err != nil {
+			slog.Error("Failed to scale up", "error", err)
+			return nil, fmt.Errorf("failed to scale up new instance: %w", err)
+		}
+		a.Orchestrator.ReserveExisting(instance)
+		return instance, nil
+	}
+
+	return nil, errors.New("max replicas reached, no instance available")
+}
+
+// freshPlaybackConn closes idle keep-alive connections from a.middleware's pool before opening a
+// playback connection. The AceStream engine will NOT serve the stream over a reused keep-alive
+// connection (verified in live testing: the first playback of a stream works, but re-resuming it
+// after a stop stalls because a.middleware reuses an idle connection from the previous session).
+// Only idle connections are affected; active streams keep their dedicated connection.
+func (a *Acexy) freshPlaybackConn() {
+	if tr, ok := a.middleware.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+}
+
+func (a *Acexy) StartStream(stream *AceStream, out io.Writer) error {
+	var os *ongoingStream
+
+	a.mutex.Lock()
+	var ok bool
+	os, ok = a.streams[stream.ID]
 	if !ok {
+		a.mutex.Unlock()
 		slog.Debug("Stream not found", "stream", stream.ID)
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
 
-	// Add the writer to the list of writers
-	ongoingStream.writers.Add(out)
+	// Register the client and count it under the lock.
+	os.writers.Add(out)
+	os.clients++
 
-	// Register the new client
-	ongoingStream.clients++
-
-	// Calculate total clients across all streams
-	var totalClients uint
-	for _, s := range a.streams {
-		totalClients += s.clients
-	}
-
-	if ongoingStream.player != nil {
-		if ongoingStream.instance != nil {
-			slog.Info("Reusing existing stream", "id", stream.ID, "stream_clients", ongoingStream.clients,
-				"total_clients", totalClients, "instance", ongoingStream.instance.Name)
-		} else {
-			slog.Info("Reusing existing stream", "id", stream.ID, "stream_clients", ongoingStream.clients,
-				"total_clients", totalClients)
-		}
+	// If the stream is already playing, reuse it (the new client is served by the fan-out).
+	if os.player != nil {
+		a.logClients("Reusing existing stream", stream.ID, os, true)
+		a.mutex.Unlock()
 		return nil
 	}
-	if ongoingStream.instance != nil {
-		slog.Info("Started new stream", "id", stream.ID, "stream_clients", ongoingStream.clients,
-			"total_clients", totalClients, "instance", ongoingStream.instance.Name)
-	} else {
-		slog.Info("Started new stream", "id", stream.ID, "stream_clients", ongoingStream.clients,
-			"total_clients", totalClients)
+
+	// Playback not started yet: single-flight the boot. Only one StartStream issues the Get.
+	if os.bootStarting {
+		done := os.bootDone
+		a.mutex.Unlock()
+		<-done
+		a.mutex.Lock()
+		os2, ok2 := a.streams[stream.ID]
+		if !ok2 {
+			a.mutex.Unlock()
+			slog.Debug("Stream released while waiting for playback", "stream", stream.ID)
+			return fmt.Errorf(`stream "%s" not found`, stream.ID)
+		}
+		if os2.player != nil {
+			a.logClients("Reusing existing stream", stream.ID, os2, false)
+			a.mutex.Unlock()
+			return nil
+		}
+		bootErr := os2.bootErr
+		a.mutex.Unlock()
+		if bootErr != nil {
+			a.rollbackClient(stream.ID, out)
+			slog.Error("Failed to forward stream", "stream", stream.ID, "error", bootErr)
+			return bootErr
+		}
+		a.logClients("Reusing existing stream", stream.ID, os2, false)
+		return nil
 	}
 
-	// Check if the stream is already being played
+	// We are the boot owner. Mark boot in progress and log the new stream start.
+	os.bootStarting = true
+	os.bootDone = make(chan struct{})
+	a.logClients("Started new stream", stream.ID, os, true)
+	a.mutex.Unlock()
 
+	// Network OUTSIDE the global mutex: a slow/hung middleware only stalls this stream, not the
+	// whole proxy. a.middleware has ResponseHeaderTimeout = NoResponseTimeout, so this is bounded.
+	// Force a fresh connection: the engine does not serve over a reused keep-alive connection.
+	a.freshPlaybackConn()
 	resp, err := a.middleware.Get(stream.PlaybackURL)
 	if err != nil {
 		slog.Error("Failed to forward stream", "error", err)
-		ongoingStream.clients--
-		if ongoingStream.clients == 0 {
-			if releaseErr := a.releaseStream(stream); releaseErr != nil {
-				slog.Warn("Error releasing stream", "error", releaseErr)
-			}
-		}
+		a.mutex.Lock()
+		os.bootErr = err
+		os.bootStarting = false
+		close(os.bootDone)
+		a.mutex.Unlock()
+		a.rollbackClient(stream.ID, out)
 		return err
 	}
 
-	// Forward the response to the writers
+	// Success: wire the copier and the stream loop under a short lock, then wake the waiters.
+	a.mutex.Lock()
+	if cur, ok := a.streams[stream.ID]; !ok || cur != os {
+		// The stream was released (all clients left) while we were fetching the playback.
+		a.mutex.Unlock()
+		_ = resp.Body.Close()
+		a.rollbackClient(stream.ID, out)
+		return fmt.Errorf(`stream "%s" was released during start`, stream.ID)
+	}
 	idType, id := stream.ID.ID()
-	ongoingStream.copier = &Copier{
-		Destination:  ongoingStream.writers,
+	os.copier = &Copier{
+		Destination:  os.writers,
 		Source:       resp.Body,
 		EmptyTimeout: a.EmptyTimeout,
 		BufferSize:   a.BufferSize,
 		StreamID:     string(idType) + ":" + id,
 	}
-
-	go a.runStreamLoop(ongoingStream, stream)
-
-	ongoingStream.player = resp
+	go a.runStreamLoop(os, stream)
+	os.player = resp
+	os.bootStarting = false
+	close(os.bootDone)
+	a.mutex.Unlock()
 	return nil
+}
+
+// logClients logs stream lifecycle lines with per-stream and total client counts.
+func (a *Acexy) logClients(message string, id AceID, os *ongoingStream, withTotal bool) {
+	var totalClients uint
+	if withTotal {
+		for _, s := range a.streams {
+			totalClients += s.clients
+		}
+	}
+	if os.instance != nil {
+		if withTotal {
+			slog.Info(message, "id", id, "stream_clients", os.clients,
+				"total_clients", totalClients, "instance", os.instance.Name)
+		} else {
+			slog.Info(message, "id", id, "stream_clients", os.clients,
+				"instance", os.instance.Name)
+		}
+		return
+	}
+	if withTotal {
+		slog.Info(message, "id", id, "stream_clients", os.clients, "total_clients", totalClients)
+		return
+	}
+	slog.Info(message, "id", id, "stream_clients", os.clients)
+}
+
+// rollbackClient removes a client that was registered in StartStream but whose stream failed to
+// boot. If it was the last client, the stream is released (network I/O performed outside the
+// lock). Caller must NOT hold Acexy.mutex.
+func (a *Acexy) rollbackClient(id AceID, out io.Writer) {
+	a.mutex.Lock()
+	os, ok := a.streams[id]
+	if !ok {
+		a.mutex.Unlock()
+		return
+	}
+	os.writers.Remove(out)
+	if os.clients > 0 {
+		os.clients--
+	}
+	if os.clients == 0 {
+		delete(a.streams, id)
+		a.mutex.Unlock()
+		a.releaseClosedStream(os)
+		return
+	}
+	a.mutex.Unlock()
 }
 
 // runStreamLoop manages the copy lifecycle of a stream.
@@ -346,22 +505,22 @@ func (a *Acexy) handleStall(os *ongoingStream, stream *AceStream) error {
 }
 
 // migrateStream moves a stream from an unhealthy instance to a healthy one.
-// Decrements ActiveStreams on the old instance and increments it on the new one.
+// It reserves the target atomically and releases the old instance's reservation.
 func (a *Acexy) migrateStream(os *ongoingStream, stream *AceStream) error {
 	slog.Warn("Instance unhealthy, migrating stream",
 		"stream", stream.ID,
 		"oldInstance", os.instance.Name,
 	)
-	newInstance, err := a.getOrCreateHealthyInstance()
+	newInstance, err := a.acquireInstance()
 	if err != nil {
 		return fmt.Errorf("no healthy instance available for migration: %w", err)
 	}
 
-	if os.instance.ActiveStreams > 0 {
-		os.instance.ActiveStreams--
+	// acquireInstance already reserved the new instance (+1); release the old one's
+	// reservation so the accounting moves cleanly across instances.
+	if os.instance != nil {
+		a.Orchestrator.ReleaseInstance(os.instance)
 	}
-	newInstance.ActiveStreams++
-	newInstance.LastActivity = time.Now()
 	os.instance = newInstance
 
 	slog.Info("Stream migrated", "stream", stream.ID, "newInstance", newInstance.Name)
@@ -373,6 +532,8 @@ func (a *Acexy) reconnectStream(os *ongoingStream, stream *AceStream) error {
 	if os.instance != nil {
 		slog.Info("Reconnecting stream", "stream", stream.ID, "instance", os.instance.Name)
 	}
+	// Force a fresh connection on reconnect for the same reason as StartStream.
+	a.freshPlaybackConn()
 	newResp, err := a.middleware.Get(stream.PlaybackURL)
 	if err != nil {
 		return err
@@ -388,18 +549,6 @@ func (a *Acexy) reconnectStream(os *ongoingStream, stream *AceStream) error {
 	return nil
 }
 
-// getOrCreateHealthyInstance selects a healthy instance from the pool or creates a new one if none is available.
-func (a *Acexy) getOrCreateHealthyInstance() (*orchestrator.AceStreamInstance, error) {
-	instance := a.Orchestrator.SelectInstance()
-	if instance != nil {
-		return instance, nil
-	}
-	if a.Orchestrator.TotalInstances() < a.Orchestrator.MaxReplicas {
-		return a.Orchestrator.ScaleUp()
-	}
-	return nil, errors.New("max replicas reached, no healthy instance available")
-}
-
 // closeStreamDone closes the stream's done channel if it has not been closed already.
 func (a *Acexy) closeStreamDone(os *ongoingStream, id AceID) {
 	if os.instance != nil {
@@ -407,65 +556,25 @@ func (a *Acexy) closeStreamDone(os *ongoingStream, id AceID) {
 	} else {
 		slog.Debug("Copy done", "stream", id)
 	}
-	select {
-	case <-os.done:
-		slog.Debug("Stream already closed", "stream", id)
-	default:
-		close(os.done)
-		if os.instance != nil {
-			slog.Info("Stream closed", "stream", id, "instance", os.instance.Name)
-		} else {
-			slog.Info("Stream closed", "stream", id)
-		}
+	a.closeDoneOnce(os)
+	if os.instance != nil {
+		slog.Info("Stream closed", "stream", id, "instance", os.instance.Name)
+	} else {
+		slog.Info("Stream closed", "stream", id)
 	}
 }
 
-// Releases a stream that is no longer being used. The stream is removed from the AceStream backend.
-// If the stream is not enqueued, an error is returned. If the stream has clients reproducing it,
-// the stream is not removed. The stream is identified by the "id" identifier.
-//
-// Note: The global mutex is locked and unlocked by the caller.
-func (a *Acexy) releaseStream(stream *AceStream) error {
-	ongoingStream, ok := a.streams[stream.ID]
-	if !ok {
-		return fmt.Errorf(`stream "%s" not found`, stream.ID)
+// closeDoneOnce closes the stream's done channel exactly once (idempotent, safe under the lock).
+// Caller must hold Acexy.mutex.
+func (a *Acexy) closeDoneOnce(os *ongoingStream) {
+	if os == nil {
+		return
 	}
-	if ongoingStream.clients > 0 {
-		return fmt.Errorf(`stream "%s" has clients`, stream.ID)
-	}
-
-	// Decrement ActiveStreams on the instance when the last client leaves
-	if ongoingStream.instance != nil {
-		if ongoingStream.instance.ActiveStreams > 0 {
-			ongoingStream.instance.ActiveStreams--
-		}
-		ongoingStream.instance.LastActivity = time.Now()
-		slog.Debug("Instance stream count after release", "instance", ongoingStream.instance.Name,
-			"activeStreams", ongoingStream.instance.ActiveStreams)
-	}
-
-	// Remove the stream from the list
-	defer delete(a.streams, stream.ID)
-	slog.Debug("Stopping stream", "stream", stream.ID)
-	// Close the stream
-	if err := CloseStream(stream); err != nil {
-		slog.Debug("Error closing stream", "error", err)
-		return err
-	}
-	if ongoingStream.player != nil {
-		slog.Debug("Closing player", "stream", stream.ID)
-		ongoingStream.player.Body.Close()
-	}
-
-	// Close the `done' channel
 	select {
-	case <-ongoingStream.done:
-		slog.Debug("Stream already closed", "stream", stream.ID)
+	case <-os.done:
 	default:
-		close(ongoingStream.done)
-		slog.Debug("Stream done", "stream", stream.ID)
+		close(os.done)
 	}
-	return nil
 }
 
 // Finishes a stream. The stream is removed from the AceStream backend. If the stream is not
@@ -473,35 +582,68 @@ func (a *Acexy) releaseStream(stream *AceStream) error {
 // removed. The stream is identified by the “id“ identifier.
 func (a *Acexy) StopStream(stream *AceStream, out io.Writer) error {
 	a.mutex.Lock()
-	defer a.mutex.Unlock()
 
-	// Get the ongoing stream
-	ongoingStream, ok := a.streams[stream.ID]
+	os, ok := a.streams[stream.ID]
 	if !ok {
+		a.mutex.Unlock()
 		slog.Debug("Stream not found", "stream", stream.ID)
 		return fmt.Errorf(`stream "%s" not found`, stream.ID)
 	}
 
 	// Remove the writer from the list of writers
-	ongoingStream.writers.Remove(out)
+	os.writers.Remove(out)
 
 	// Unregister the client
-	if ongoingStream.clients > 0 {
-		ongoingStream.clients--
-		slog.Info("Client stopped", "stream", stream.ID, "clients", ongoingStream.clients)
+	if os.clients > 0 {
+		os.clients--
+		slog.Info("Client stopped", "stream", stream.ID, "clients", os.clients)
 	} else {
 		slog.Warn("Stream has no clients", "stream", stream.ID)
 	}
 
-	// Check if we have to stop the stream
-	if ongoingStream.clients == 0 {
-		if err := a.releaseStream(stream); err != nil {
-			slog.Warn("Error releasing stream", "error", err)
-			return err
-		}
+	// If this was the last client, detach the stream from the map under the lock and release it
+	// (network I/O) OUTSIDE the lock. Deleting under the lock guarantees only one goroutine can
+	// win the release, so CloseStream is issued exactly once.
+	if os.clients == 0 {
+		delete(a.streams, stream.ID)
+		a.mutex.Unlock()
+		a.releaseClosedStream(os)
 		slog.Info("Stream done", "stream", stream.ID)
+		return nil
 	}
+
+	a.mutex.Unlock()
 	return nil
+}
+
+// releaseClosedStream tears down a stream that has already been detached from the map (by the
+// caller under the lock). All network I/O (CloseStream to the engine, player body close) and the
+// done-channel close happen here, OUTSIDE the global mutex.
+func (a *Acexy) releaseClosedStream(os *ongoingStream) {
+	if os == nil {
+		return
+	}
+
+	if os.instance != nil {
+		a.Orchestrator.ReleaseInstance(os.instance)
+		slog.Debug("Instance stream count after release", "instance", os.instance.Name)
+	}
+
+	if os.stream != nil {
+		slog.Debug("Stopping stream", "stream", os.stream.ID)
+		if err := CloseStream(os.stream, a.NoResponseTimeout); err != nil {
+			slog.Debug("Error closing stream", "error", err)
+		}
+	}
+
+	if os.player != nil {
+		slog.Debug("Closing player", "stream", os.stream.ID)
+		_ = os.player.Body.Close()
+	}
+
+	a.mutex.Lock()
+	a.closeDoneOnce(os)
+	a.mutex.Unlock()
 }
 
 // Waits for the stream to finish. The stream is identified by the “id“ identifier. If the stream
@@ -518,6 +660,22 @@ func (a *Acexy) WaitStream(stream *AceStream) <-chan struct{} {
 	}
 
 	return ongoingStream.done
+}
+
+// newControlClient returns an http.Client that must be used for CONTROL requests against the
+// AceStream engine (getstream / getstreamfrominstance / close). The engine does NOT tolerate
+// reusing keep-alive connections from a shared pool between a control request and the playback
+// that follows it, so each call builds a fresh transport (no shared pool). A Connection: close
+// header is set by the callers. The timeout bounds how long a hung engine can hold a caller.
+func newControlClient(timeout time.Duration) *http.Client {
+	transport := &http.Transport{
+		DisableCompression: true,
+	}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+	}
+	return client
 }
 
 // Performs a request to the AceStream backend to start a new stream. It uses the Acexy
@@ -547,10 +705,14 @@ func GetStream(a *Acexy, aceId AceID, extraParams url.Values) (*AceStreamMiddlew
 	extraParams.Set("pid", pid)
 	// and set the headers
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connection", "close")
 	req.URL.RawQuery = extraParams.Encode()
 
 	slog.Debug("Request URL", "url", req.URL.String())
-	client := &http.Client{}
+
+	// Control request: fresh per-call connection, never a shared pool.
+	client := newControlClient(a.NoResponseTimeout)
+	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		slog.Debug("Error getting stream", "error", err)
@@ -583,7 +745,9 @@ func GetStream(a *Acexy, aceId AceID, extraParams url.Values) (*AceStreamMiddlew
 // Closes the stream by performing a request to the AceStream backend. The `stream` parameter
 // contains the command URL to send data to the middleware. As of the documentation, it is needed
 // to add a "method=stop" query parameter to finish the stream.
-func CloseStream(stream *AceStream) error {
+//
+// controlTimeout bounds the request so a hung engine aborts cleanly instead of blocking forever.
+func CloseStream(stream *AceStream, controlTimeout time.Duration) error {
 	req, err := http.NewRequest("GET", stream.CommandURL, nil)
 	if err != nil {
 		return err
@@ -592,8 +756,11 @@ func CloseStream(stream *AceStream) error {
 	q := req.URL.Query()
 	q.Add("method", "stop")
 	req.URL.RawQuery = q.Encode()
+	req.Header.Set("Connection", "close")
 
-	client := &http.Client{}
+	// Control request: fresh per-call connection, never a shared pool.
+	client := newControlClient(controlTimeout)
+	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		return err
@@ -633,8 +800,9 @@ func (a *Acexy) GetStatus(id *AceID) (AcexyStatus, error) {
 		return AcexyStatus{Streams: &streams}, nil
 	}
 
-	// Check if the stream is already enqueued
-	if stream, ok := a.streams[*id]; ok {
+	// Check if the stream is already enqueued. An entry whose stream is still nil is a
+	// "fetch in progress" placeholder (not yet enqueued), so it is reported as not found.
+	if stream, ok := a.streams[*id]; ok && stream.stream != nil {
 		return AcexyStatus{
 			Clients: &stream.clients,
 			ID:      id,
@@ -665,10 +833,14 @@ func GetStreamFromInstance(instance *orchestrator.AceStreamInstance, a *Acexy, a
 	extraParams.Set("format", "json")
 	extraParams.Set("pid", pid)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connection", "close")
 	req.URL.RawQuery = extraParams.Encode()
 
 	slog.Debug("Request URL", "url", req.URL.String())
-	client := &http.Client{}
+
+	// Control request: fresh per-call connection, never a shared pool.
+	client := newControlClient(a.NoResponseTimeout)
+	defer client.CloseIdleConnections()
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
