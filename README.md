@@ -315,6 +315,18 @@ experience, but you may need to adjust them to fit your needs.
       <th><em>empty</em></th>
     </tr>
     <tr>
+      <th><code>-acestream-live-buffer</code></th>
+      <th><code>ACESTREAM_LIVE_BUFFER</code></th>
+      <th>Value of the engine <code>--live-buffer</code> flag applied to every AceStream instance. Instances always run with <code>--live-cache-type memory</code>.</th>
+      <th><code>40</code></th>
+    </tr>
+    <tr>
+      <th><code>-acestream-tmpfs-size</code></th>
+      <th><code>ACESTREAM_TMPFS_SIZE</code></th>
+      <th>Size of the tmpfs mounted on <code>/acestream/.ACEStream</code> (engine cache) in every AceStream instance, e.g. <code>256M</code>.</th>
+      <th><code>256M</code></th>
+    </tr>
+    <tr>
       <th><code>-docker-host</code></th>
       <th><code>DOCKER_HOST</code></th>
       <th>Docker host URL. Should point to a Docker socket proxy, never mount the socket directly.</th>

@@ -27,6 +27,38 @@ func randomHex(n int) string {
 
 const defaultRegularNetwork = "bridge"
 
+const (
+	// DefaultLiveBuffer is the engine --live-buffer value used when
+	// ACESTREAM_LIVE_BUFFER is not set.
+	DefaultLiveBuffer = 40
+	// DefaultTmpfsSize is the engine cache tmpfs size used when
+	// ACESTREAM_TMPFS_SIZE is not set.
+	DefaultTmpfsSize = "256M"
+
+	engineCacheDir = "/acestream/.ACEStream"
+)
+
+// engineArgs returns the arguments passed to the AceStream engine of every
+// instance. Setting Cmd replaces the image's default CMD, so the base
+// arguments of the acestream-vpn-switch image (--client-console --bind-all)
+// are repeated here and the live-buffer/cache flags are appended.
+func (o *Orchestrator) engineArgs() []string {
+	return []string{
+		"--client-console",
+		"--bind-all",
+		"--live-buffer", strconv.Itoa(o.liveBuffer),
+		"--live-cache-type", "memory",
+	}
+}
+
+// engineTmpfs returns the tmpfs mounts for every instance, keeping the engine
+// cache directory in RAM.
+func (o *Orchestrator) engineTmpfs() map[string]string {
+	return map[string]string{
+		engineCacheDir: "rw,size=" + o.tmpfsSize,
+	}
+}
+
 // containerRemoveOptions returns the standard options for removing containers.
 // containerRemoveOptions returns the standard options for removing containers.
 func containerRemoveOptions() container.RemoveOptions {
@@ -63,11 +95,13 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 	cfg := &container.Config{
 		Image:  o.image,
 		Labels: labels,
+		Cmd:    strslice.StrSlice(o.engineArgs()),
 	}
 
 	hostCfg := &container.HostConfig{
 		RestartPolicy: container.RestartPolicy{Name: "no"},
 		AutoRemove:    true, // remove container and its anonymous volumes automatically when it stops
+		Tmpfs:         o.engineTmpfs(),
 	}
 
 	if len(o.dnsServers) > 0 {

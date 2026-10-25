@@ -50,6 +50,8 @@ var (
 	vpnSwitchAfter            time.Duration
 	acestreamImage            string
 	acestreamDNSServers       string
+	acestreamLiveBuffer       int
+	acestreamTmpfsSize        string
 	dockerHost                string
 	containerFailureThreshold int
 	streamFailureThreshold    int
@@ -502,6 +504,20 @@ func parseArgs() {
 		LookupEnvOrString("ACEXY_ACESTREAM_DNS_SERVERS", ""),
 		"comma-separated DNS servers applied to AceStream containers. Can be set with ACEXY_ACESTREAM_DNS_SERVERS environment variable",
 	)
+	flag.IntVar(
+		&acestreamLiveBuffer,
+		"acestream-live-buffer",
+		LookupEnvOrInt("ACESTREAM_LIVE_BUFFER", orchestrator.DefaultLiveBuffer),
+		"value of the AceStream engine --live-buffer flag applied to every instance. "+
+			"Can be set with ACESTREAM_LIVE_BUFFER environment variable",
+	)
+	flag.StringVar(
+		&acestreamTmpfsSize,
+		"acestream-tmpfs-size",
+		LookupEnvOrString("ACESTREAM_TMPFS_SIZE", orchestrator.DefaultTmpfsSize),
+		"size of the tmpfs mounted on the AceStream engine cache directory of every instance (e.g. 256M). "+
+			"Can be set with ACESTREAM_TMPFS_SIZE environment variable",
+	)
 	flag.StringVar(
 		&dockerHost,
 		"docker-host",
@@ -555,6 +571,8 @@ func main() {
 		Image:                     acestreamImage,
 		DockerHost:                dockerHost,
 		DNSServers:                acestreamDNSServers,
+		LiveBuffer:                acestreamLiveBuffer,
+		TmpfsSize:                 acestreamTmpfsSize,
 		ComposeProject:            composeProject,
 		ComposeWorkingDir:         composeWorkingDir,
 		ContainerNetwork:          containerNetwork,

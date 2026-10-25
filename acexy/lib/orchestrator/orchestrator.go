@@ -49,6 +49,8 @@ type Orchestrator struct {
 	vpnSwitchAfter       time.Duration // seconds before switching from VPN back to normal network
 	image                string        // Docker image to use
 	dnsServers           []string      // DNS servers to apply to created containers (empty = Docker default)
+	liveBuffer           int           // value of the engine --live-buffer flag
+	tmpfsSize            string        // size of the tmpfs mounted on the engine cache directory
 	lastPoolActivity     time.Time     // last time any stream was active across the whole pool
 	recycled             bool          // true after a recycle, reset only when a new stream arrives
 	recycleCheckInterval time.Duration // how often recycleIfIdle is checked
@@ -67,6 +69,8 @@ type Orchestrator struct {
 	Image                     string
 	DockerHost                string
 	DNSServers                string // comma-separated DNS servers for AceStream containers
+	LiveBuffer                int    // engine --live-buffer value (<= 0 = DefaultLiveBuffer)
+	TmpfsSize                 string // engine cache tmpfs size, e.g. 256M (empty = DefaultTmpfsSize)
 	ComposeProject            string // value of com.docker.compose.project
 	ComposeWorkingDir         string // value of com.docker.compose.project.working_dir
 	ContainerNetwork          string // Docker network acexy is connected to; used to attach AceStream instances
@@ -85,6 +89,15 @@ func (o *Orchestrator) Init() error {
 	o.vpnSwitchAfter = o.VPNSwitchAfter
 	o.image = o.Image
 	o.dnsServers = parseDNSServers(o.DNSServers)
+
+	o.liveBuffer = o.LiveBuffer
+	if o.liveBuffer <= 0 {
+		o.liveBuffer = DefaultLiveBuffer
+	}
+	o.tmpfsSize = strings.TrimSpace(o.TmpfsSize)
+	if o.tmpfsSize == "" {
+		o.tmpfsSize = DefaultTmpfsSize
+	}
 
 	o.lastPoolActivity = time.Now()
 
