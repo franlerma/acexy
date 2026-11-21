@@ -52,6 +52,8 @@ var (
 	acestreamDNSServers       string
 	acestreamLiveBuffer       int
 	acestreamTmpfsSize        string
+	acestreamEngineArgs       string
+	acestreamEngineEnv        string
 	dockerHost                string
 	containerFailureThreshold int
 	streamFailureThreshold    int
@@ -519,6 +521,22 @@ func parseArgs() {
 			"Can be set with ACESTREAM_TMPFS_SIZE environment variable",
 	)
 	flag.StringVar(
+		&acestreamEngineArgs,
+		"acestream-engine-args",
+		LookupEnvOrString("ACESTREAM_ENGINE_ARGS", ""),
+		"whitespace-separated arguments passed to the engine of every instance, replacing the AceStream defaults "+
+			"(e.g. \"serve\" for outpace-engine). Empty = AceStream defaults. "+
+			"Can be set with ACESTREAM_ENGINE_ARGS environment variable",
+	)
+	flag.StringVar(
+		&acestreamEngineEnv,
+		"acestream-engine-env",
+		LookupEnvOrString("ACESTREAM_ENGINE_ENV", ""),
+		"comma-separated KEY=VALUE environment variables added to every engine container "+
+			"(e.g. \"OUTPACE_ACE_COMPAT=1\"). Values cannot contain commas. "+
+			"Can be set with ACESTREAM_ENGINE_ENV environment variable",
+	)
+	flag.StringVar(
 		&dockerHost,
 		"docker-host",
 		LookupEnvOrString("DOCKER_HOST", "tcp://docker-proxy:2375"),
@@ -573,6 +591,8 @@ func main() {
 		DNSServers:                acestreamDNSServers,
 		LiveBuffer:                acestreamLiveBuffer,
 		TmpfsSize:                 acestreamTmpfsSize,
+		EngineArgs:                acestreamEngineArgs,
+		EngineEnv:                 acestreamEngineEnv,
 		ComposeProject:            composeProject,
 		ComposeWorkingDir:         composeWorkingDir,
 		ContainerNetwork:          containerNetwork,
