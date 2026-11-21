@@ -51,6 +51,8 @@ type Orchestrator struct {
 	dnsServers           []string      // DNS servers to apply to created containers (empty = Docker default)
 	liveBuffer           int           // value of the engine --live-buffer flag
 	tmpfsSize            string        // size of the tmpfs mounted on the engine cache directory
+	engineCmd            []string      // custom engine arguments (empty = AceStream defaults)
+	engineEnv            []string      // extra KEY=VALUE environment for engine containers
 	lastPoolActivity     time.Time     // last time any stream was active across the whole pool
 	recycled             bool          // true after a recycle, reset only when a new stream arrives
 	recycleCheckInterval time.Duration // how often recycleIfIdle is checked
@@ -71,6 +73,8 @@ type Orchestrator struct {
 	DNSServers                string // comma-separated DNS servers for AceStream containers
 	LiveBuffer                int    // engine --live-buffer value (<= 0 = DefaultLiveBuffer)
 	TmpfsSize                 string // engine cache tmpfs size, e.g. 256M (empty = DefaultTmpfsSize)
+	EngineArgs                string // whitespace-separated engine arguments replacing the AceStream defaults (empty = defaults)
+	EngineEnv                 string // comma-separated KEY=VALUE environment added to every engine container
 	ComposeProject            string // value of com.docker.compose.project
 	ComposeWorkingDir         string // value of com.docker.compose.project.working_dir
 	ContainerNetwork          string // Docker network acexy is connected to; used to attach AceStream instances
@@ -98,6 +102,13 @@ func (o *Orchestrator) Init() error {
 	if o.tmpfsSize == "" {
 		o.tmpfsSize = DefaultTmpfsSize
 	}
+
+	o.engineCmd = parseEngineArgs(o.EngineArgs)
+	engineEnv, err := parseEngineEnv(o.EngineEnv)
+	if err != nil {
+		return err
+	}
+	o.engineEnv = engineEnv
 
 	o.lastPoolActivity = time.Now()
 
@@ -127,7 +138,6 @@ func (o *Orchestrator) Init() error {
 		dockerHost = "tcp://docker-proxy:2375"
 	}
 
-	var err error
 	o.dockerClient, err = client.NewClientWithOpts(
 		client.WithHost(dockerHost),
 		client.WithAPIVersionNegotiation(),

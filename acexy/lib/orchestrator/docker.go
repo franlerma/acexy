@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -38,11 +39,17 @@ const (
 	engineCacheDir = "/acestream/.ACEStream"
 )
 
-// engineArgs returns the arguments passed to the AceStream engine of every
-// instance. Setting Cmd replaces the image's default CMD, so the base
-// arguments of the acestream-vpn-switch image (--client-console --bind-all)
-// are repeated here and the live-buffer/cache flags are appended.
+// engineArgs returns the arguments passed to the engine of every instance.
+// Setting Cmd replaces the image's default CMD, so the base arguments of the
+// acestream-vpn-switch image (--client-console --bind-all) are repeated here
+// and the live-buffer/cache flags are appended.
+//
+// When ACESTREAM_ENGINE_ARGS is set it is used verbatim instead, which allows
+// engines with a different CLI (e.g. outpace-engine, which takes "serve").
 func (o *Orchestrator) engineArgs() []string {
+	if len(o.engineCmd) > 0 {
+		return o.engineCmd
+	}
 	return []string{
 		"--client-console",
 		"--bind-all",
@@ -59,7 +66,36 @@ func (o *Orchestrator) engineTmpfs() map[string]string {
 	}
 }
 
-// containerRemoveOptions returns the standard options for removing containers.
+// parseEngineArgs splits a whitespace-separated argument string into a slice.
+// Returns nil if the string is empty.
+func parseEngineArgs(s string) []string {
+	args := strings.Fields(s)
+	if len(args) == 0 {
+		return nil
+	}
+	return args
+}
+
+// parseEngineEnv parses a comma-separated list of KEY=VALUE pairs into the
+// "KEY=VALUE" slice expected by the Docker API. Whitespace around entries is
+// trimmed and empty entries are skipped. Values cannot contain commas. An entry
+// without "=" or with an empty key is an error so misconfiguration fails fast.
+func parseEngineEnv(csv string) ([]string, error) {
+	var env []string
+	for _, part := range strings.Split(csv, ",") {
+		entry := strings.TrimSpace(part)
+		if entry == "" {
+			continue
+		}
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			return nil, fmt.Errorf("invalid engine env entry %q: expected KEY=VALUE", entry)
+		}
+		env = append(env, entry)
+	}
+	return env, nil
+}
+
 // containerRemoveOptions returns the standard options for removing containers.
 func containerRemoveOptions() container.RemoveOptions {
 	return container.RemoveOptions{
@@ -125,15 +161,19 @@ func (o *Orchestrator) createContainer(ctx context.Context) (string, string, str
 		},
 	}
 
+	// Extra user-defined environment (ACESTREAM_ENGINE_ENV). The VPN variables
+	// below are appended last so they always win on duplicates.
+	cfg.Env = append(cfg.Env, o.engineEnv...)
+
 	if o.vpnContainer != "" {
 		// In VPN mode the instance runs on the normal bridge network (its own IP)
 		// but needs NET_ADMIN so the acestream-vpn-switch entrypoint can change
 		// the default route at runtime (VPN -> normal).
 		hostCfg.CapAdd = strslice.StrSlice{"NET_ADMIN"}
-		cfg.Env = []string{
-			"ACESTREAM_VPN_CONTAINER=" + o.vpnContainer,
-			"ACESTREAM_VPN_SWITCH_AFTER=" + strconv.Itoa(int(o.vpnSwitchAfter.Seconds())),
-		}
+		cfg.Env = append(cfg.Env,
+			"ACESTREAM_VPN_CONTAINER="+o.vpnContainer,
+			"ACESTREAM_VPN_SWITCH_AFTER="+strconv.Itoa(int(o.vpnSwitchAfter.Seconds())),
+		)
 	}
 
 	if err := o.pullImageIfNeeded(ctx); err != nil {
