@@ -9,6 +9,8 @@ env:
     DOCKERHUB_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acexy
     GHCR_ENGINE_IMAGE: ghcr.io/${{ github.repository_owner }}/acestream-vpn-switch
     DOCKERHUB_ENGINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/acestream-vpn-switch
+    GHCR_OUTPACE_IMAGE: ghcr.io/${{ github.repository_owner }}/outpace-vpn-switch
+    DOCKERHUB_OUTPACE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/outpace-vpn-switch
 
 jobs:
     build-and-push-image:
@@ -57,6 +59,16 @@ jobs:
                 flavor: |
                   latest=${{ !github.event.release.prerelease }}
 
+            - name: Extract metadata (tags, labels) for the outpace engine
+              id: meta-outpace
+              uses: docker/metadata-action@v5
+              with:
+                images: |
+                  ${{ env.GHCR_OUTPACE_IMAGE }}
+                  ${{ env.DOCKERHUB_OUTPACE_IMAGE }}
+                flavor: |
+                  latest=${{ !github.event.release.prerelease }}
+
             - name: Set up QEMU
               uses: docker/setup-qemu-action@v3
 
@@ -86,6 +98,18 @@ jobs:
                 tags: ${{ steps.meta-engine.outputs.tags }}
                 labels: ${{ steps.meta-engine.outputs.labels }}
 
+            # Capa 3: wrapper de outpace-engine con enrutado por VPN (engine/Dockerfile.outpace)
+            - name: Build and push the engine (outpace-vpn-switch)
+              id: push-outpace
+              uses: docker/build-push-action@v6
+              with:
+                context: ./engine
+                file: ./engine/Dockerfile.outpace
+                platforms: linux/amd64,linux/arm64,linux/arm/v7
+                push: true
+                tags: ${{ steps.meta-outpace.outputs.tags }}
+                labels: ${{ steps.meta-outpace.outputs.labels }}
+
             - name: Generate artifact attestation for acexy
               uses: actions/attest-build-provenance@v1
               with:
@@ -98,6 +122,13 @@ jobs:
               with:
                 subject-name: ${{ env.GHCR_ENGINE_IMAGE }}
                 subject-digest: ${{ steps.push-engine.outputs.digest }}
+                push-to-registry: true
+
+            - name: Generate artifact attestation for the outpace engine
+              uses: actions/attest-build-provenance@v1
+              with:
+                subject-name: ${{ env.GHCR_OUTPACE_IMAGE }}
+                subject-digest: ${{ steps.push-outpace.outputs.digest }}
                 push-to-registry: true
 
             - name: Update release information

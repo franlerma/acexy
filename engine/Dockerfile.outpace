@@ -1,0 +1,21 @@
+ARG OUTPACE_IMAGE=ghcr.io/outpace-stream/outpace-engine:latest
+FROM ${OUTPACE_IMAGE}
+
+# The base image runs as the non-root 'outpace' user; apt needs root.
+USER root
+
+# Add iproute2 so the container's default gateway (route) can be changed at
+# runtime to send the engine's traffic through a VPN container.
+# The entrypoint runs as root to be able to touch the routing table
+# (CAP_NET_ADMIN); the engine itself is launched as 'outpace' via setpriv.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY outpace-switch-entrypoint.sh /outpace-switch-entrypoint.sh
+RUN chmod +x /outpace-switch-entrypoint.sh
+
+ENTRYPOINT ["/outpace-switch-entrypoint.sh"]
+
+# Same default as the base image; acexy overrides it with ACESTREAM_ENGINE_ARGS.
+CMD ["serve"]
